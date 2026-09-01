@@ -8,27 +8,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    env:
-      SSH_USERNAME: "ubuntuadmin"
-      SSH_PASSWORD: "P@ssw0rd123!" # بهتر است در Secrets قرار گیرد ولی در صورت ثابت بودن ماسک می‌شود
-
     steps:
 
       # ==========================================================
-      # 1. Prepare Ubuntu & Mask Secrets
+      # 1. Prepare Ubuntu
       # ==========================================================
       - name: 1. Prepare Ubuntu
         shell: bash
         run: |
           set -e
-          # Mask password from appearing in raw GitHub logs
-          echo "::add-mask::$SSH_PASSWORD"
 
           echo "=========================================="
           echo "Preparing Ubuntu..."
           echo "=========================================="
 
           sudo apt-get update
+
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             openssh-server \
             curl \
@@ -37,43 +32,50 @@ jobs:
             iproute2 \
             net-tools
 
-          echo "Ubuntu and Kernel info:"
-          cat /etc/os-release | grep PRETTY_NAME
+          echo
+          echo "Ubuntu version:"
+          grep PRETTY_NAME /etc/os-release || true
+
+          echo
+          echo "Kernel:"
           uname -a
 
-
       # ==========================================================
-      # 2. Create SSH User + Sudo Permissions
+      # 2. Create SSH User
       # ==========================================================
       - name: 2. Create SSH User
         shell: bash
         run: |
           set -e
 
+          USERNAME="ubuntuadmin"
+          PASSWORD="P@ssw0rd123!"
+
           echo "=========================================="
           echo "Creating SSH user..."
           echo "=========================================="
 
-          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
-              sudo useradd \
-                --create-home \
-                --shell /bin/bash \
-                "$SSH_USERNAME"
+          # Create user if it doesn't already exist
+          if ! id "$USERNAME" >/dev/null 2>&1; then
+            sudo useradd \
+              --create-home \
+              --shell /bin/bash \
+              "$USERNAME"
           fi
 
-          sudo usermod -aG sudo "$SSH_USERNAME"
-          echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
-          sudo chage -M 99999 "$SSH_USERNAME"
+          # Add user to sudo group
+          sudo usermod -aG sudo "$USERNAME"
 
-          # Give sudo rights without password prompt for convenience
-          echo "$SSH_USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-cloud-user > /dev/null
-          sudo chmod 0440 /etc/sudoers.d/90-cloud-user
+          # Set password
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
 
-          echo "User $SSH_USERNAME created successfully."
+          # Prevent password expiration
+          sudo chage -M 99999 "$USERNAME"
 
+          echo "User created successfully."
 
       # ==========================================================
-      # 3. Configure SSH (First-match Priority)
+      # 3. Configure OpenSSH
       # ==========================================================
       - name: 3. Configure OpenSSH
         shell: bash
@@ -84,13 +86,19 @@ jobs:
           echo "Configuring OpenSSH..."
           echo "=========================================="
 
+          # IMPORTANT:
+          # GitHub Ubuntu runners may not have /run/sshd
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
+
+          # Make sure SSH config directory exists
           sudo mkdir -p /etc/ssh/sshd_config.d
 
-          # Using 00-* ensures this configuration takes precedence over others
-          sudo tee /etc/ssh/sshd_config.d/00-cloud-server.conf > /dev/null <<'EOF'
+          # Create custom SSH configuration
+          sudo tee /etc/ssh/sshd_config.d/99-cloud-server.conf > /dev/null <<'EOF'
           PasswordAuthentication yes
           KbdInteractiveAuthentication yes
-          PubkeyAuthentication yes
+          PubkeyAuthentication no
           PermitRootLogin no
           UsePAM yes
           X11Forwarding no
@@ -99,19 +107,29 @@ jobs:
           ClientAliveCountMax 10
           EOF
 
-          # Validate SSH config
+          echo "Testing SSH configuration..."
+
+          # Validate sshd configuration
           sudo sshd -t
 
-          # Handle both systemd service & socket (Ubuntu 22/24 compatibility)
-          sudo systemctl daemon-reload
-          sudo systemctl restart ssh || sudo systemctl restart ssh.service || true
-          if systemctl list-unit-files | grep -q "ssh.socket"; then
-              sudo systemctl restart ssh.socket || true
-          fi
+          echo "SSH configuration is valid."
 
-          echo "Listening SSH ports:"
+          # Enable SSH service
+          sudo systemctl enable ssh
+
+          # Start/restart SSH
+          sudo systemctl restart ssh
+
+          echo
+          echo "SSH service:"
+          sudo systemctl is-active ssh
+
+          echo
+          echo "SSH listening port:"
           sudo ss -tlnp | grep ':22' || true
 
+          echo
+          echo "OpenSSH configured successfully."
 
       # ==========================================================
       # 4. Install Tailscale
@@ -124,30 +142,37 @@ jobs:
           set -e
 
           if [ -z "$TAILSCALE_AUTHKEY" ]; then
-              echo "ERROR: TAILSCALE_AUTHKEY is empty in Secrets!"
-              exit 1
+            echo "ERROR: TAILSCALE_AUTHKEY is empty."
+            echo
+            echo "Create this GitHub Actions secret:"
+            echo "TAILSCALE_AUTHKEY"
+            exit 1
           fi
 
           echo "=========================================="
           echo "Installing Tailscale..."
           echo "=========================================="
 
+          # Install Tailscale
           curl -fsSL https://tailscale.com/install.sh | sh
 
-          sudo systemctl enable tailscaled
-          sudo systemctl restart tailscaled
-          sleep 3
+          # Enable service
+          sudo systemctl enable --now tailscaled
+
+          echo "Waiting for tailscaled..."
+          sleep 5
 
           echo "Connecting to Tailscale..."
-          # --reset clears previous ephemeral conflicts
+
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="github-ubuntu-server" \
-            --reset
+            --hostname="github-ubuntu-server"
 
           sleep 5
-          sudo tailscale status
 
+          echo
+          echo "Tailscale status:"
+          sudo tailscale status
 
       # ==========================================================
       # 5. Configure Firewall
@@ -161,75 +186,96 @@ jobs:
           echo "Configuring UFW..."
           echo "=========================================="
 
+          # Default policies
           sudo ufw default deny incoming
           sudo ufw default allow outgoing
 
-          # Allow Tailscale WireGuard Direct Port (improves speed / P2P)
-          sudo ufw allow 41641/udp || true
-
-          # Allow SSH on Tailscale interface
+          # SSH is allowed ONLY through Tailscale
           sudo ufw allow in on tailscale0 to any port 22 proto tcp
 
+          # Enable firewall
           sudo ufw --force enable
+
+          echo
+          echo "UFW status:"
           sudo ufw status verbose
 
-
       # ==========================================================
-      # 6. Test SSH User & Port
+      # 6. Final Server Check
       # ==========================================================
-      - name: 6. Test SSH Configuration
+      - name: 6. Final Server Check
         shell: bash
         run: |
           set -e
 
           echo "=========================================="
-          echo "Testing SSH configuration..."
+          echo "Performing final checks..."
           echo "=========================================="
 
-          id "$SSH_USERNAME"
+          # Make sure /run/sshd still exists
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
 
-          if ! sudo ss -tln | grep -q ':22'; then
-              echo "ERROR: SSH is not listening on port 22."
-              exit 1
+          # SSH check
+          if ! systemctl is-active --quiet ssh; then
+            echo "SSH is not active."
+            sudo systemctl restart ssh
           fi
 
-          echo "SSH configuration verified."
+          # Tailscale check
+          if ! sudo tailscale status >/dev/null 2>&1; then
+            echo "Tailscale is not connected."
+            exit 1
+          fi
 
-
-      # ==========================================================
-      # 7. Get Tailscale IP + Server Information
-      # ==========================================================
-      - name: 7. Show Server Information
-        shell: bash
-        run: |
-          set -e
-
+          # Get Tailscale IPv4
           TAILSCALE_IP=$(sudo tailscale ip -4 | head -n 1)
 
           if [ -z "$TAILSCALE_IP" ]; then
-              echo "ERROR: Could not get Tailscale IPv4."
-              exit 1
+            echo "ERROR: Could not obtain Tailscale IPv4."
+            exit 1
           fi
 
-          echo ""
-          echo "======================================================"
-          echo "              UBUNTU SERVER IS READY"
-          echo "======================================================"
-          echo "Hostname       : $(hostname)"
-          echo "CPU Cores      : $(nproc)"
-          echo "Memory (RAM)   : $(free -h | awk '/^Mem:/ {print $2}')"
-          echo "Disk Free      : $(df -h / | awk 'NR==2 {print $4}')"
-          echo "Tailscale IPv4 : $TAILSCALE_IP"
-          echo "SSH Username   : $SSH_USERNAME"
-          echo "SSH Password   : $SSH_PASSWORD"
-          echo "SSH Command    : ssh $SSH_USERNAME@$TAILSCALE_IP"
-          echo "======================================================"
-
+          echo
+          echo "=============================================="
+          echo "        UBUNTU SERVER IS READY"
+          echo "=============================================="
+          echo
+          echo "Operating System:"
+          grep PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '"'
+          echo
+          echo "Hostname:"
+          hostname
+          echo
+          echo "CPU Cores:"
+          nproc
+          echo
+          echo "Memory:"
+          free -h
+          echo
+          echo "Disk:"
+          df -h /
+          echo
+          echo "Tailscale IPv4:"
+          echo "$TAILSCALE_IP"
+          echo
+          echo "SSH Username:"
+          echo "ubuntuadmin"
+          echo
+          echo "SSH Password:"
+          echo "P@ssw0rd123!"
+          echo
+          echo "SSH Command:"
+          echo "ssh ubuntuadmin@$TAILSCALE_IP"
+          echo
+          echo "=============================================="
 
       # ==========================================================
-      # 8. Keep Server Alive + Health Check
+      # 7. Keep Server Alive
       # ==========================================================
-      - name: 8. Keep Ubuntu Server Alive
+      - name: 7. Keep Ubuntu Server Alive
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         shell: bash
         run: |
           set -u
@@ -238,27 +284,93 @@ jobs:
           echo "Ubuntu server is running..."
           echo "=========================================="
 
-          # 340 minutes loop
+          # Stay alive for approximately 5h 40m.
+          # Workflow timeout is 6 hours.
           for i in $(seq 1 340); do
 
-              CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-              echo "[$i/340] [$CURRENT_TIME] Health Check..."
+            echo
+            echo "------------------------------------------"
+            echo "[$i/340] Health Check"
+            echo "------------------------------------------"
 
-              # ---------------- SSH Check ----------------
-              if ! sudo ss -tln | grep -q ':22'; then
-                  echo "SSH is down. Restarting..."
-                  sudo systemctl restart ssh || sudo systemctl restart ssh.service || true
-              fi
+            echo "Time:"
+            date '+%Y-%m-%d %H:%M:%S'
 
-              # ------------- Tailscale Check -------------
-              if ! sudo tailscale status >/dev/null 2>&1; then
-                  echo "Tailscale down. Restarting tailscaled..."
-                  sudo systemctl restart tailscaled || true
-                  sleep 3
-                  sudo tailscale up || true
-              fi
+            # ----------------------------------------------------
+            # Ensure sshd runtime directory exists
+            # ----------------------------------------------------
+            if [ ! -d /run/sshd ]; then
+              echo "/run/sshd missing. Creating it..."
+              sudo mkdir -p /run/sshd
+              sudo chmod 755 /run/sshd
+            fi
 
-              sleep 60
+            # ----------------------------------------------------
+            # Check SSH
+            # ----------------------------------------------------
+            if systemctl is-active --quiet ssh; then
+              echo "SSH: OK"
+            else
+              echo "SSH: DOWN"
+              echo "Restarting SSH..."
+
+              sudo mkdir -p /run/sshd
+              sudo chmod 755 /run/sshd
+
+              sudo systemctl restart ssh || true
+            fi
+
+            # ----------------------------------------------------
+            # Check Tailscale
+            # ----------------------------------------------------
+            if sudo tailscale status >/dev/null 2>&1; then
+              echo "Tailscale: OK"
+            else
+              echo "Tailscale: DOWN"
+              echo "Attempting Tailscale reconnect..."
+
+              sudo systemctl restart tailscaled || true
+
+              sleep 5
+
+              sudo tailscale up \
+                --authkey="$TAILSCALE_AUTHKEY" \
+                --hostname="github-ubuntu-server" || true
+            fi
+
+            # ----------------------------------------------------
+            # Get current Tailscale IP
+            # ----------------------------------------------------
+            TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null | head -n 1 || true)
+
+            if [ -n "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP: $TAILSCALE_IP"
+            else
+              echo "Tailscale IP: unavailable"
+            fi
+
+            # ----------------------------------------------------
+            # Disk usage
+            # ----------------------------------------------------
+            echo
+            echo "Disk:"
+            df -h / | tail -n 1
+
+            # ----------------------------------------------------
+            # Memory usage
+            # ----------------------------------------------------
+            echo
+            echo "Memory:"
+            free -h | head -n 2
+
+            # ----------------------------------------------------
+            # Wait one minute
+            # ----------------------------------------------------
+            sleep 60
+
           done
 
-          echo "Keep-alive finished."
+          echo
+          echo "=========================================="
+          echo "Keep-alive period finished."
+          echo "=========================================="
